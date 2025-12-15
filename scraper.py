@@ -60,11 +60,16 @@ class Scraper:
         """
 
         chrome_options = Options()
-        chrome_options.add_argument("--headless")
+        # Use new headless mode (less detectable than old --headless)
+        chrome_options.add_argument("--headless=new")
         # Use wide viewport to get higher resolution previews from Box.com
-        chrome_options.add_argument("--window-size=2560x4000")
+        chrome_options.add_argument("--window-size=2560,4000")
         # Force high DPI to get sharper images (simulates retina display)
         chrome_options.add_argument("--force-device-scale-factor=2")
+        # Anti-detection flags to appear more like a real browser
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
         # Enable performance logging for CDP network interception
         chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
