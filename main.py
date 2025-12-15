@@ -30,10 +30,11 @@ from scraper import Scraper, url_checker
 @click.option('--out', '-o', default=None, help='Output file folder location')
 @click.option('--max-pages', default=None, type=int, help='Maximum pages to capture (for testing)')
 @click.option('--scroll-pause', default=1.5, type=float, help='Pause between scrolls in seconds')
+@click.option('--cdp/--no-cdp', default=True, help='Use CDP network interception (faster)')
 @click.option('--pdf/--no-pdf', default=True, help='Concatenate all pages into a single PDF')
 @click.option('--keep-images/--no-keep-images', default=True, help='Keep individual images after creating PDF')
 @click.version_option(version='2.0', prog_name='Box.com PDF Downloader')
-def main(url, driver_path, wait_time, out, max_pages, scroll_pause, pdf, keep_images):
+def main(url, driver_path, wait_time, out, max_pages, scroll_pause, cdp, pdf, keep_images):
     """Download PDF previews from Box.com shared links.
 
     URL: The box.com shared URL to download from
@@ -50,29 +51,40 @@ def main(url, driver_path, wait_time, out, max_pages, scroll_pause, pdf, keep_im
     if out is None:
         out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dl_files")
 
-    box_object = Scraper(url, driver_path, wait_time)
-    box_object.load_url()
-    dl_name = box_object.get_download_title()
+    box_object = None
+    dl_name = None
+    output_dir = None
+    num_images = 0
 
-    click.echo(style)
-    click.echo(f"Title: {click.style(dl_name, fg='green')}")
-    click.echo(f"URL: {url}")
+    try:
+        box_object = Scraper(url, driver_path, wait_time)
+        box_object.load_url()
+        dl_name = box_object.get_download_title()
 
-    # Create output directory for images
-    output_dir = os.path.join(out, dl_name)
-    os.makedirs(output_dir, exist_ok=True)
+        click.echo(style)
+        click.echo(f"Title: {click.style(dl_name, fg='green')}")
+        click.echo(f"URL: {url}")
 
-    click.echo(style)
-    click.echo("Capturing preview images by scrolling...")
-    num_images = box_object.capture_preview_images(output_dir, scroll_pause=scroll_pause, max_pages=max_pages)
+        # Create output directory for images
+        output_dir = os.path.join(out, dl_name)
+        os.makedirs(output_dir, exist_ok=True)
 
-    click.echo(style)
-    click.secho(f"✓ Captured {num_images} images to: {output_dir}", fg='green')
+        click.echo(style)
+        if cdp:
+            click.echo("Capturing preview images via CDP network interception...")
+            num_images = box_object.capture_preview_images_cdp(output_dir, scroll_pause=scroll_pause, max_pages=max_pages)
+        else:
+            click.echo("Capturing preview images by scrolling...")
+            num_images = box_object.capture_preview_images(output_dir, scroll_pause=scroll_pause, max_pages=max_pages)
 
-    box_object.clean()
+        click.echo(style)
+        click.secho(f"✓ Captured {num_images} images to: {output_dir}", fg='green')
+    finally:
+        if box_object:
+            box_object.clean()
 
     # Create PDF if requested
-    if pdf and num_images > 0:
+    if pdf and num_images > 0 and dl_name and output_dir:
         pdf_path = os.path.join(out, f"{dl_name}.pdf")
         click.echo(f"Creating PDF: {pdf_path}")
 

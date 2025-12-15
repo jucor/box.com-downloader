@@ -13,11 +13,16 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+import atexit
 import base64
 import os
 import re
+import signal
+import subprocess
 import sys
 import time
+import threading
+from queue import Queue, Empty
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -56,7 +61,12 @@ class Scraper:
 
         chrome_options = Options()
         chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--window-size=1280x800")
+        # Use wide viewport to get higher resolution previews from Box.com
+        chrome_options.add_argument("--window-size=2560x4000")
+        # Force high DPI to get sharper images (simulates retina display)
+        chrome_options.add_argument("--force-device-scale-factor=2")
+        # Enable performance logging for CDP network interception
+        chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
         self.wait_load_time = wait_time
         self.driver_location = driver_location
@@ -66,6 +76,39 @@ class Scraper:
         else:
             service = Service(ChromeDriverManager().install())
         self.driver_obj = webdriver.Chrome(service=service, options=chrome_options)
+
+        # Register cleanup handlers to prevent shell crashes
+        atexit.register(self._cleanup)
+        self._original_sigint = signal.signal(signal.SIGINT, self._signal_handler)
+        self._original_sigterm = signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _cleanup(self):
+        """Ensure ChromeDriver is properly terminated."""
+        try:
+            if hasattr(self, 'driver_obj') and self.driver_obj:
+                self.driver_obj.quit()
+                self.driver_obj = None
+        except Exception:
+            pass
+        # Kill any orphaned chromedriver processes
+        try:
+            subprocess.run(['pkill', '-f', 'chromedriver'],
+                          capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    def _signal_handler(self, signum, frame):
+        """Handle interrupt signals gracefully."""
+        print(f"\nReceived signal {signum}, cleaning up...")
+        self._cleanup()
+        sys.exit(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.clean()
+        return False
 
     def load_url(self):
         """
@@ -146,6 +189,419 @@ class Scraper:
             if ("internal_files" in name) and ("pdf" in name):  # check for a pdf file
                 download_url = name
         return download_url
+
+    def capture_preview_images_cdp(self, output_dir, scroll_pause=0.5, max_pages=None):
+        """
+        Optimized capture using blob URL conversion.
+        Box.com uses blob: URLs which can't be intercepted via network.
+        This method converts blob images to data URLs efficiently.
+        :param output_dir: Directory to save the images
+        :param scroll_pause: Time to wait after each scroll
+        :param max_pages: Maximum number of pages to capture (None for unlimited)
+        :return: Number of images captured
+        """
+        driver = self.driver_obj
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"Starting optimized blob capture... (max: {max_pages or 'unlimited'})")
+
+        # Get estimated page count from scroll height or page indicator
+        page_info = driver.execute_script("""
+            var result = {total: null, estimated: null};
+
+            // Try to get exact page count from text (e.g., "1 of 500")
+            var text = document.body.innerText;
+            var match = text.match(/of\\s+(\\d+)/i) || text.match(/(\\d+)\\s+pages?/i);
+            if (match) result.total = parseInt(match[1]);
+
+            // Estimate from scroll height and actual page element height
+            var selectors = ['.bp-doc', '[class*="bp-doc"]', '.PreviewContent', '[class*="PreviewContent"]'];
+            for (var i = 0; i < selectors.length; i++) {
+                var els = document.querySelectorAll(selectors[i]);
+                for (var j = 0; j < els.length; j++) {
+                    var container = els[j];
+                    if (container.scrollHeight > 10000) {
+                        // Try to find actual page elements to get real page height
+                        var pages = container.querySelectorAll('[class*="page"], [class*="Page"], img[src^="blob:"], img[src^="data:"]');
+                        if (pages.length > 0) {
+                            var firstPage = pages[0];
+                            var pageHeight = firstPage.getBoundingClientRect().height;
+                            if (pageHeight > 100) {
+                                // Add small margin between pages (~10px)
+                                result.estimated = Math.floor(container.scrollHeight / (pageHeight + 10));
+                                break;
+                            }
+                        }
+                        // Fallback: assume ~1000px per page (typical for PDFs at 72dpi)
+                        result.estimated = Math.floor(container.scrollHeight / 1000);
+                        break;
+                    }
+                }
+            }
+            return result;
+        """)
+
+        total_pages = page_info.get('total') or page_info.get('estimated')
+        if total_pages:
+            print(f"Detected {total_pages} pages")
+
+        # Inject helper to convert blob URLs to data URLs efficiently
+        driver.execute_script("""
+            window._blobCapture = {
+                seenBlobs: new Set(),
+                pendingImages: [],
+
+                captureImage: function(img) {
+                    return new Promise((resolve) => {
+                        if (!img.complete) {
+                            img.onload = () => this.doCapture(img, resolve);
+                        } else {
+                            this.doCapture(img, resolve);
+                        }
+                    });
+                },
+
+                doCapture: function(img, resolve) {
+                    try {
+                        var canvas = document.createElement('canvas');
+                        canvas.width = img.naturalWidth || img.width;
+                        canvas.height = img.naturalHeight || img.height;
+                        var ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0);
+                        resolve(canvas.toDataURL('image/png'));
+                    } catch(e) {
+                        resolve(null);
+                    }
+                },
+
+                // Hash image content for deduplication (not URL)
+                hashDataUrl: function(dataUrl) {
+                    var data = dataUrl.split(',')[1] || '';
+                    if (data.length < 1000) return data;
+                    // Sample from multiple parts of the image data for content-based hash
+                    return data.substring(100, 300) +
+                           data.substring(Math.floor(data.length/2), Math.floor(data.length/2) + 200) +
+                           data.substring(data.length - 300);
+                },
+
+                collectNewBlobs: async function(minWidth, fallbackMinWidth) {
+                    var results = [];
+                    minWidth = minWidth || 1000;  // Default: prefer high-res images (1024px)
+                    fallbackMinWidth = fallbackMinWidth || 850;  // Accept 890px images as fallback
+
+                    // Collect both blob: and data: images
+                    var imgs = document.querySelectorAll('img');
+                    var highResImages = [];
+                    var lowResImages = [];
+
+                    for (var i = 0; i < imgs.length; i++) {
+                        var img = imgs[i];
+                        var src = img.src;
+                        var rect = img.getBoundingClientRect();
+
+                        // Only process visible, reasonably sized images
+                        if (rect.width > 50 && rect.height > 50 && img.naturalWidth >= fallbackMinWidth) {
+                            var dataUrl = null;
+                            if (src.startsWith('blob:')) {
+                                dataUrl = await this.captureImage(img);
+                            } else if (src.startsWith('data:') && src.length > 1000) {
+                                dataUrl = src;
+                            }
+
+                            if (dataUrl && dataUrl.length > 1000) {
+                                // Use content hash for deduplication, not URL
+                                var contentHash = this.hashDataUrl(dataUrl);
+                                if (!this.seenBlobs.has(contentHash)) {
+                                    var imgData = { dataUrl: dataUrl, width: img.naturalWidth, height: img.naturalHeight, hash: contentHash };
+                                    if (img.naturalWidth >= minWidth) {
+                                        highResImages.push(imgData);
+                                    } else {
+                                        lowResImages.push(imgData);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Also capture canvas elements
+                    var canvases = document.querySelectorAll('canvas');
+                    for (var i = 0; i < canvases.length; i++) {
+                        var canvas = canvases[i];
+                        var rect = canvas.getBoundingClientRect();
+                        if (canvas.width >= fallbackMinWidth && rect.height > 100) {
+                            try {
+                                var dataUrl = canvas.toDataURL('image/png');
+                                if (dataUrl.length > 1000) {
+                                    var contentHash = this.hashDataUrl(dataUrl);
+                                    if (!this.seenBlobs.has(contentHash)) {
+                                        var imgData = { dataUrl: dataUrl, width: canvas.width, height: canvas.height, hash: contentHash };
+                                        if (canvas.width >= minWidth) {
+                                            highResImages.push(imgData);
+                                        } else {
+                                            lowResImages.push(imgData);
+                                        }
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                    }
+
+                    // Prefer high-res, but include low-res if no high-res available
+                    // Mark all as seen to avoid re-capturing
+                    for (var i = 0; i < highResImages.length; i++) {
+                        this.seenBlobs.add(highResImages[i].hash);
+                        results.push(highResImages[i]);
+                    }
+                    // Only add low-res if we haven't captured many high-res this round
+                    if (highResImages.length === 0 && lowResImages.length > 0) {
+                        for (var i = 0; i < lowResImages.length; i++) {
+                            this.seenBlobs.add(lowResImages[i].hash);
+                            results.push(lowResImages[i]);
+                        }
+                    }
+
+                    return results;
+                },
+
+                getSeenCount: function() {
+                    return this.seenBlobs.size;
+                },
+
+                scrollContainer: null,
+                lastScrollTop: -1,
+
+                findScrollContainer: function() {
+                    if (this.scrollContainer && document.contains(this.scrollContainer)) {
+                        return this.scrollContainer;
+                    }
+                    // Find the actual scrollable container with preview content
+                    var selectors = ['.bp-doc', '[class*="bp-doc"]', '.PreviewContent', '[class*="PreviewContent"]', '[class*="bcpr"]', '[class*="preview"]'];
+                    for (var i = 0; i < selectors.length; i++) {
+                        var els = document.querySelectorAll(selectors[i]);
+                        for (var j = 0; j < els.length; j++) {
+                            var el = els[j];
+                            if (el.scrollHeight > el.clientHeight + 100) {
+                                this.scrollContainer = el;
+                                return el;
+                            }
+                        }
+                    }
+                    // Fallback: find any large scrollable element
+                    var all = document.querySelectorAll('*');
+                    for (var i = 0; i < all.length; i++) {
+                        var el = all[i];
+                        if (el.scrollHeight > 5000 && el.scrollHeight > el.clientHeight + 100) {
+                            var style = window.getComputedStyle(el);
+                            if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
+                                this.scrollContainer = el;
+                                return el;
+                            }
+                        }
+                    }
+                    return null;
+                },
+
+                scroll: function(amount) {
+                    var container = this.findScrollContainer();
+                    if (container) {
+                        var oldTop = container.scrollTop;
+                        container.scrollTop += amount || 800;
+                        // Check if we actually scrolled
+                        if (container.scrollTop === oldTop && oldTop > 0) {
+                            // We might be at the end
+                            return { scrolled: false, atEnd: true, scrollTop: container.scrollTop, scrollHeight: container.scrollHeight };
+                        }
+                        this.lastScrollTop = container.scrollTop;
+                        return { scrolled: true, atEnd: false, scrollTop: container.scrollTop, scrollHeight: container.scrollHeight };
+                    }
+                    // Fallback to window scroll
+                    var oldY = window.scrollY;
+                    window.scrollBy(0, amount || 800);
+                    return { scrolled: window.scrollY !== oldY, atEnd: false, scrollTop: window.scrollY, scrollHeight: document.body.scrollHeight };
+                },
+
+                getScrollInfo: function() {
+                    var container = this.findScrollContainer();
+                    if (container) {
+                        return {
+                            scrollTop: container.scrollTop,
+                            scrollHeight: container.scrollHeight,
+                            clientHeight: container.clientHeight,
+                            atEnd: container.scrollTop + container.clientHeight >= container.scrollHeight - 50
+                        };
+                    }
+                    return {
+                        scrollTop: window.scrollY,
+                        scrollHeight: document.body.scrollHeight,
+                        clientHeight: window.innerHeight,
+                        atEnd: window.scrollY + window.innerHeight >= document.body.scrollHeight - 50
+                    };
+                },
+
+                // Wait for images in viewport to fully load at high resolution
+                waitForHighRes: function(targetWidth) {
+                    targetWidth = targetWidth || 1000;
+                    return new Promise((resolve) => {
+                        var checkCount = 0;
+                        var lastResolutions = '';
+                        var stableCount = 0;
+                        var hasHighRes = false;
+                        var check = () => {
+                            var imgs = document.querySelectorAll('img');
+                            var resolutions = [];
+                            hasHighRes = false;
+                            for (var i = 0; i < imgs.length; i++) {
+                                var img = imgs[i];
+                                var rect = img.getBoundingClientRect();
+                                // Check if image is in viewport
+                                if (rect.top < window.innerHeight && rect.bottom > 0 && rect.width > 50) {
+                                    resolutions.push(img.naturalWidth + 'x' + img.naturalHeight);
+                                    if (img.naturalWidth >= targetWidth) {
+                                        hasHighRes = true;
+                                    }
+                                }
+                            }
+                            var resStr = resolutions.join(',');
+                            // Wait until resolutions stabilize (no changes for 3-5 checks)
+                            if (resStr === lastResolutions) {
+                                stableCount++;
+                            } else {
+                                stableCount = 0;
+                                lastResolutions = resStr;
+                            }
+                            checkCount++;
+                            // Wait longer if we haven't seen high-res yet (up to 50 checks = 7.5s)
+                            var maxChecks = hasHighRes ? 30 : 50;
+                            var stableTarget = hasHighRes ? 3 : 5;
+                            if (stableCount >= stableTarget || checkCount > maxChecks) {
+                                resolve({ hasHighRes: hasHighRes, checkCount: checkCount });
+                            } else {
+                                setTimeout(check, 150);
+                            }
+                        };
+                        check();
+                    });
+                },
+
+                // Get info about visible images
+                getVisibleImageInfo: function() {
+                    var imgs = document.querySelectorAll('img');
+                    var info = [];
+                    for (var i = 0; i < imgs.length; i++) {
+                        var img = imgs[i];
+                        var rect = img.getBoundingClientRect();
+                        if (rect.width > 50 && rect.height > 50) {
+                            info.push({
+                                inViewport: rect.top < window.innerHeight && rect.bottom > 0,
+                                naturalWidth: img.naturalWidth,
+                                naturalHeight: img.naturalHeight,
+                                src: img.src.substring(0, 50)
+                            });
+                        }
+                    }
+                    return info;
+                }
+            };
+        """)
+
+        pbar_total = max_pages if max_pages else (total_pages or 100)
+        pbar = tqdm(total=pbar_total, unit="pages", desc="Capturing", dynamic_ncols=True)
+
+        page_count = 0
+        no_new_count = 0
+        scroll_count = 0
+        max_scrolls = (max_pages or total_pages or 500) * 3  # Allow many scroll attempts
+
+        while no_new_count < 15 and scroll_count < max_scrolls:
+            if max_pages and page_count >= max_pages:
+                break
+
+            # Collect new blob images (async JS returns a promise)
+            new_images = driver.execute_async_script("""
+                var callback = arguments[arguments.length - 1];
+                window._blobCapture.collectNewBlobs().then(callback);
+            """)
+
+            # Save new images
+            batch_count = 0
+            for img_data in (new_images or []):
+                if max_pages and page_count >= max_pages:
+                    break
+
+                page_count += 1
+                batch_count += 1
+                try:
+                    data_url = img_data['dataUrl']
+                    header, data = data_url.split(',', 1)
+                    ext = 'png' if 'png' in header else 'jpg'
+                    filename = os.path.join(output_dir, f"page_{page_count:04d}.{ext}")
+                    with open(filename, 'wb') as f:
+                        f.write(base64.b64decode(data))
+                except Exception as e:
+                    pbar.write(f"Error saving page {page_count}: {e}")
+                    page_count -= 1
+                    batch_count -= 1
+
+            # Update progress bar once per batch for accurate rate
+            if batch_count > 0:
+                pbar.update(batch_count)
+
+            if not new_images:
+                no_new_count += 1
+            else:
+                no_new_count = 0
+
+            # Scroll and check if we've reached the end
+            scroll_result = driver.execute_script("return window._blobCapture.scroll(800);")
+            scroll_count += 1
+
+            # If we're at the end of the document, stop
+            if scroll_result and scroll_result.get('atEnd'):
+                scroll_info = driver.execute_script("return window._blobCapture.getScrollInfo();")
+                if scroll_info.get('atEnd'):
+                    pbar.write(f"Reached end of document at scroll position {scroll_info.get('scrollTop')}/{scroll_info.get('scrollHeight')}")
+                    # Do one more collection pass then exit
+                    driver.execute_async_script("""
+                        var callback = arguments[arguments.length - 1];
+                        window._blobCapture.waitForHighRes().then(callback);
+                    """)
+                    time.sleep(scroll_pause)
+                    # Final collection
+                    final_images = driver.execute_async_script("""
+                        var callback = arguments[arguments.length - 1];
+                        window._blobCapture.collectNewBlobs().then(callback);
+                    """)
+                    for img_data in (final_images or []):
+                        if max_pages and page_count >= max_pages:
+                            break
+                        page_count += 1
+                        try:
+                            data_url = img_data['dataUrl']
+                            header, data = data_url.split(',', 1)
+                            ext = 'png' if 'png' in header else 'jpg'
+                            filename = os.path.join(output_dir, f"page_{page_count:04d}.{ext}")
+                            with open(filename, 'wb') as f:
+                                f.write(base64.b64decode(data))
+                            pbar.update(1)
+                        except Exception as e:
+                            pbar.write(f"Error saving page {page_count}: {e}")
+                            page_count -= 1
+                    break
+
+            # Wait for high-res images to load
+            wait_result = driver.execute_async_script("""
+                var callback = arguments[arguments.length - 1];
+                window._blobCapture.waitForHighRes(1000).then(callback);
+            """)
+            # If no high-res detected, wait a bit longer
+            if wait_result and not wait_result.get('hasHighRes'):
+                time.sleep(scroll_pause * 1.5)
+            else:
+                time.sleep(scroll_pause * 0.5)
+
+        pbar.close()
+        print(f"Captured {page_count} pages via blob conversion")
+        return page_count
 
     def capture_preview_images(self, output_dir, scroll_pause=1.5, max_pages=None):
         """
@@ -283,36 +739,83 @@ class Scraper:
                         return this.seenHashes.size;
                     },
 
-                    scroll: function() {
-                        var scrolled = false;
+                    scrollContainer: null,
+
+                    findScrollContainer: function() {
+                        if (this.scrollContainer && document.contains(this.scrollContainer)) {
+                            return this.scrollContainer;
+                        }
                         var selectors = [
                             '.bp-doc', '[class*="bp-doc"]',
                             '.PreviewContent', '[class*="PreviewContent"]',
-                            '[class*="bcpr"]'
+                            '[class*="bcpr"]', '[class*="preview"]'
                         ];
-
                         for (var i = 0; i < selectors.length; i++) {
                             var els = document.querySelectorAll(selectors[i]);
                             for (var j = 0; j < els.length; j++) {
                                 var el = els[j];
-                                if (el.scrollHeight > el.clientHeight) {
-                                    el.scrollTop += 800;
-                                    scrolled = true;
+                                if (el.scrollHeight > el.clientHeight + 100) {
+                                    this.scrollContainer = el;
+                                    return el;
                                 }
                             }
                         }
-
-                        if (!scrolled) {
-                            window.scrollBy(0, 800);
+                        // Fallback: find any large scrollable element
+                        var all = document.querySelectorAll('*');
+                        for (var i = 0; i < all.length; i++) {
+                            var el = all[i];
+                            if (el.scrollHeight > 5000 && el.scrollHeight > el.clientHeight + 100) {
+                                var style = window.getComputedStyle(el);
+                                if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
+                                    this.scrollContainer = el;
+                                    return el;
+                                }
+                            }
                         }
+                        return null;
+                    },
 
-                        return scrolled;
+                    scroll: function(amount) {
+                        amount = amount || 800;
+                        var container = this.findScrollContainer();
+                        if (container) {
+                            var oldTop = container.scrollTop;
+                            container.scrollTop += amount;
+                            if (container.scrollTop === oldTop && oldTop > 0) {
+                                return { scrolled: false, atEnd: true };
+                            }
+                            return { scrolled: true, atEnd: false };
+                        }
+                        var oldY = window.scrollY;
+                        window.scrollBy(0, amount);
+                        return { scrolled: window.scrollY !== oldY, atEnd: false };
+                    },
+
+                    getScrollInfo: function() {
+                        var container = this.findScrollContainer();
+                        if (container) {
+                            return {
+                                scrollTop: container.scrollTop,
+                                scrollHeight: container.scrollHeight,
+                                clientHeight: container.clientHeight,
+                                atEnd: container.scrollTop + container.clientHeight >= container.scrollHeight - 50
+                            };
+                        }
+                        return {
+                            scrollTop: window.scrollY,
+                            scrollHeight: document.body.scrollHeight,
+                            clientHeight: window.innerHeight,
+                            atEnd: window.scrollY + window.innerHeight >= document.body.scrollHeight - 50
+                        };
                     }
                 };
             """)
 
             # Main capture loop - optimized
-            while no_new_images_count < 10:
+            scroll_count = 0
+            max_scrolls = (max_pages or estimated_pages or 500) * 3
+
+            while no_new_images_count < 15 and scroll_count < max_scrolls:
                 # Check if we've reached max pages
                 if max_pages and len(page_images) >= max_pages:
                     pbar.write(f"Reached max pages limit ({max_pages})")
@@ -353,8 +856,33 @@ class Scraper:
                     no_new_images_count = 0
                     last_image_count = current_count
 
-                # Scroll and wait for new content
-                driver.execute_script("window._boxCapture.scroll();")
+                # Scroll and check for end of document
+                scroll_result = driver.execute_script("return window._boxCapture.scroll(800);")
+                scroll_count += 1
+
+                if scroll_result and scroll_result.get('atEnd'):
+                    scroll_info = driver.execute_script("return window._boxCapture.getScrollInfo();")
+                    if scroll_info.get('atEnd'):
+                        pbar.write(f"Reached end of document")
+                        time.sleep(scroll_pause)
+                        # Final collection
+                        final_images = driver.execute_script("return window._boxCapture.collectNewImages();")
+                        for img_data in final_images:
+                            if max_pages and len(page_images) >= max_pages:
+                                break
+                            page_num = len(page_images) + 1
+                            page_images.append(True)
+                            try:
+                                img_src = img_data['src']
+                                header, data = img_src.split(',', 1)
+                                ext = 'png' if 'png' in header else 'jpg'
+                                filename = os.path.join(output_dir, f"page_{page_num:04d}.{ext}")
+                                with open(filename, 'wb') as f:
+                                    f.write(base64.b64decode(data))
+                                pbar.update(1)
+                            except Exception as e:
+                                pbar.write(f"Error saving page {page_num}: {e}")
+                        break
 
                 # Smart wait: check for new images quickly
                 wait_start = time.time()
@@ -377,7 +905,10 @@ class Scraper:
         return len(page_images)
 
     def clean(self):
-        """
-        This will close the current selenium session
-        """
-        self.driver_obj.quit()
+        """Close the current selenium session."""
+        self._cleanup()
+        # Restore original signal handlers
+        if hasattr(self, '_original_sigint'):
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if hasattr(self, '_original_sigterm'):
+            signal.signal(signal.SIGTERM, self._original_sigterm)
