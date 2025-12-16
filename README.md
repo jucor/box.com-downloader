@@ -56,9 +56,17 @@ uv run python main.py --from-images dl_files/MyDocument --grayscale --ocr
 | `--no-keep-images` | Delete images after creating PDF |
 | `--max-pages` | Limit number of pages to capture |
 
-## Post-processing (manual)
+## Post-processing
 
-If you prefer to run tools manually:
+To reprocess previously downloaded images (e.g., add grayscale or OCR):
+
+```sh
+uv run python main.py --from-images dl_files/MyDocument --grayscale --ocr
+```
+
+### Manual alternative
+
+If you prefer to run tools directly:
 
 ```sh
 # Convert images to PDF
