@@ -210,14 +210,40 @@ class Scraper:
 
         print(f"Starting optimized blob capture... (max: {max_pages or 'unlimited'})")
 
-        # Get estimated page count from scroll height or page indicator
+        # Trigger mouse hover to show the toolbar with page count
+        from selenium.webdriver.common.action_chains import ActionChains
+        try:
+            preview = driver.find_element('css selector', '.bp-doc, [class*="bp-doc"], .bp-content')
+            ActionChains(driver).move_to_element(preview).perform()
+            # Wait for toolbar to appear (poll for it)
+            for _ in range(20):  # Up to 2 seconds
+                if driver.execute_script("return document.querySelector('.bp-PageControls') !== null;"):
+                    break
+                time.sleep(0.1)
+        except Exception:
+            pass  # Continue even if hover fails
+
+        # Get estimated page count from toolbar or page indicator
         page_info = driver.execute_script("""
             var result = {total: null, estimated: null};
 
-            // Try to get exact page count from text (e.g., "1 of 500")
-            var text = document.body.innerText;
-            var match = text.match(/of\\s+(\\d+)/i) || text.match(/(\\d+)\\s+pages?/i);
-            if (match) result.total = parseInt(match[1]);
+            // Primary method: Get page count from toolbar (shows "1 / 480" format)
+            var pageControls = document.querySelector('.bp-PageControls, .bp-PageControlsForm, [class*="PageControls"]');
+            if (pageControls) {
+                var text = pageControls.textContent || '';
+                var match = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                if (match) result.total = parseInt(match[2]);
+            }
+
+            // Fallback: search for page patterns in body text
+            if (!result.total) {
+                var text = document.body.innerText;
+                // Look for "of X" or "X pages" patterns (avoid date patterns like 11/4/25)
+                var match = text.match(/of\\s+(\\d+)/i) || text.match(/(\\d+)\\s+pages?/i);
+                if (match) {
+                    result.total = parseInt(match[1]);
+                }
+            }
 
             // Estimate from scroll height and actual page element height
             var selectors = ['.bp-doc', '[class*="bp-doc"]', '.PreviewContent', '[class*="PreviewContent"]'];
@@ -513,28 +539,117 @@ class Scraper:
         pbar = tqdm(total=pbar_total, unit="pages", desc="Capturing", dynamic_ncols=True)
 
         page_count = 0
-        no_new_count = 0
-        scroll_count = 0
-        max_scrolls = (max_pages or total_pages or 500) * 3  # Allow many scroll attempts
+        target_pages = max_pages or total_pages or 500
 
-        while no_new_count < 15 and scroll_count < max_scrolls:
+        # Wait briefly for first page to render at high resolution
+        time.sleep(0.5)
+
+        # Use page navigation instead of scrolling for reliable capture
+        for target_page in range(1, target_pages + 1):
             if max_pages and page_count >= max_pages:
                 break
 
-            # Collect new blob images (async JS returns a promise)
-            new_images = driver.execute_async_script("""
+            # Keep toolbar visible by hovering periodically
+            if target_page % 20 == 1:
+                try:
+                    preview = driver.find_element('css selector', '.bp-doc, .bp-content')
+                    ActionChains(driver).move_to_element(preview).perform()
+                except Exception:
+                    pass
+
+            # Wait briefly for page to render, then capture the centered canvas/image
+            img_data = driver.execute_async_script("""
                 var callback = arguments[arguments.length - 1];
-                window._blobCapture.collectNewBlobs().then(callback);
+                var startTime = Date.now();
+                var maxWait = 2000;  // 2 second max wait
+                var minWidth = 800;  // Minimum acceptable width
+
+                function tryCapture() {
+                    var viewportCenter = window.innerHeight / 2;
+                    var bestElement = null;
+                    var bestDistance = Infinity;
+                    var bestType = null;
+
+                    // First, look for canvas elements (Box.com uses these for PDF rendering)
+                    var canvases = document.querySelectorAll('canvas');
+                    for (var i = 0; i < canvases.length; i++) {
+                        var c = canvases[i];
+                        var rect = c.getBoundingClientRect();
+                        if (c.width >= minWidth && rect.height > 100) {
+                            var center = rect.top + rect.height / 2;
+                            var distance = Math.abs(center - viewportCenter);
+                            if (distance < bestDistance) {
+                                bestDistance = distance;
+                                bestElement = c;
+                                bestType = 'canvas';
+                            }
+                        }
+                    }
+
+                    // Also check for images (blob: or data: src)
+                    var imgs = document.querySelectorAll('img');
+                    for (var i = 0; i < imgs.length; i++) {
+                        var img = imgs[i];
+                        var rect = img.getBoundingClientRect();
+                        if (img.naturalWidth >= minWidth && rect.height > 100 &&
+                            (img.src.startsWith('blob:') || img.src.startsWith('data:'))) {
+                            var center = rect.top + rect.height / 2;
+                            var distance = Math.abs(center - viewportCenter);
+                            if (distance < bestDistance) {
+                                bestDistance = distance;
+                                bestElement = img;
+                                bestType = 'img';
+                            }
+                        }
+                    }
+
+                    if (!bestElement) {
+                        // Nothing found yet, retry if time allows
+                        if (Date.now() - startTime < maxWait) {
+                            setTimeout(tryCapture, 100);
+                        } else {
+                            callback(null);
+                        }
+                        return;
+                    }
+
+                    // Capture the element
+                    try {
+                        var dataUrl;
+                        var width, height;
+
+                        if (bestType === 'canvas') {
+                            dataUrl = bestElement.toDataURL('image/png');
+                            width = bestElement.width;
+                            height = bestElement.height;
+                        } else {
+                            // Convert image to canvas
+                            var canvas = document.createElement('canvas');
+                            canvas.width = bestElement.naturalWidth;
+                            canvas.height = bestElement.naturalHeight;
+                            var ctx = canvas.getContext('2d');
+                            ctx.drawImage(bestElement, 0, 0);
+                            dataUrl = canvas.toDataURL('image/png');
+                            width = canvas.width;
+                            height = canvas.height;
+                        }
+
+                        if (dataUrl && dataUrl.length > 1000) {
+                            callback({ dataUrl: dataUrl, width: width, height: height });
+                        } else {
+                            callback(null);
+                        }
+                    } catch(e) {
+                        callback(null);
+                    }
+                }
+
+                tryCapture();
             """)
 
-            # Save new images
-            batch_count = 0
-            for img_data in (new_images or []):
-                if max_pages and page_count >= max_pages:
-                    break
-
+            # Save the image
+            if img_data:
                 page_count += 1
-                batch_count += 1
                 try:
                     data_url = img_data['dataUrl']
                     header, data = data_url.split(',', 1)
@@ -542,67 +657,29 @@ class Scraper:
                     filename = os.path.join(output_dir, f"page_{page_count:04d}.{ext}")
                     with open(filename, 'wb') as f:
                         f.write(base64.b64decode(data))
+                    pbar.update(1)
                 except Exception as e:
                     pbar.write(f"Error saving page {page_count}: {e}")
                     page_count -= 1
-                    batch_count -= 1
-
-            # Update progress bar once per batch for accurate rate
-            if batch_count > 0:
-                pbar.update(batch_count)
-
-            if not new_images:
-                no_new_count += 1
             else:
-                no_new_count = 0
+                pbar.write(f"Warning: Could not capture page {target_page}")
 
-            # Scroll and check if we've reached the end
-            scroll_result = driver.execute_script("return window._blobCapture.scroll(800);")
-            scroll_count += 1
-
-            # If we're at the end of the document, stop
-            if scroll_result and scroll_result.get('atEnd'):
-                scroll_info = driver.execute_script("return window._blobCapture.getScrollInfo();")
-                if scroll_info.get('atEnd'):
-                    pbar.write(f"Reached end of document at scroll position {scroll_info.get('scrollTop')}/{scroll_info.get('scrollHeight')}")
-                    # Do one more collection pass then exit
-                    driver.execute_async_script("""
-                        var callback = arguments[arguments.length - 1];
-                        window._blobCapture.waitForHighRes().then(callback);
-                    """)
-                    time.sleep(scroll_pause)
-                    # Final collection
-                    final_images = driver.execute_async_script("""
-                        var callback = arguments[arguments.length - 1];
-                        window._blobCapture.collectNewBlobs().then(callback);
-                    """)
-                    for img_data in (final_images or []):
-                        if max_pages and page_count >= max_pages:
-                            break
-                        page_count += 1
-                        try:
-                            data_url = img_data['dataUrl']
-                            header, data = data_url.split(',', 1)
-                            ext = 'png' if 'png' in header else 'jpg'
-                            filename = os.path.join(output_dir, f"page_{page_count:04d}.{ext}")
-                            with open(filename, 'wb') as f:
-                                f.write(base64.b64decode(data))
-                            pbar.update(1)
-                        except Exception as e:
-                            pbar.write(f"Error saving page {page_count}: {e}")
-                            page_count -= 1
-                    break
-
-            # Wait for high-res images to load
-            wait_result = driver.execute_async_script("""
-                var callback = arguments[arguments.length - 1];
-                window._blobCapture.waitForHighRes(1000).then(callback);
+            # Click "Next page" button to go to next page
+            next_clicked = driver.execute_script("""
+                var nextBtn = document.querySelector('[data-testid="bp-PageControls-next"]');
+                if (nextBtn && !nextBtn.disabled) {
+                    nextBtn.click();
+                    return true;
+                }
+                return false;
             """)
-            # If no high-res detected, wait a bit longer
-            if wait_result and not wait_result.get('hasHighRes'):
-                time.sleep(scroll_pause * 1.5)
-            else:
-                time.sleep(scroll_pause * 0.5)
+
+            if not next_clicked:
+                # Reached last page
+                break
+
+            # Brief pause for page transition
+            time.sleep(scroll_pause * 0.2)
 
         pbar.close()
         print(f"Captured {page_count} pages via blob conversion")
@@ -663,12 +740,34 @@ class Scraper:
                     # Estimate ~1000px per page
                     estimated_pages = c['scrollHeight'] // 1000
 
-            # Get total number of pages if available from text
+            # Trigger mouse hover to show toolbar with page count
+            from selenium.webdriver.common.action_chains import ActionChains
+            try:
+                preview = driver.find_element('css selector', '.bp-doc, [class*="bp-doc"], .bp-content')
+                ActionChains(driver).move_to_element(preview).perform()
+                for _ in range(20):
+                    if driver.execute_script("return document.querySelector('.bp-PageControls') !== null;"):
+                        break
+                    time.sleep(0.1)
+            except Exception:
+                pass
+
+            # Get total number of pages from toolbar
             total_pages = driver.execute_script("""
-                // Look for page count indicators
+                // Primary: Get from toolbar page controls (shows "1 / 480")
+                var pageControls = document.querySelector('.bp-PageControls, .bp-PageControlsForm');
+                if (pageControls) {
+                    var text = pageControls.textContent || '';
+                    var match = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                    if (match) return parseInt(match[2]);
+                }
+
+                // Fallback: search for "of X" or "X pages" patterns
                 var text = document.body.innerText;
                 var match = text.match(/of\\s+(\\d+)/i) || text.match(/(\\d+)\\s+pages?/i);
-                return match ? parseInt(match[1]) : null;
+                if (match) return parseInt(match[1]);
+
+                return null;
             """)
 
             if total_pages:
