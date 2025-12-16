@@ -1,0 +1,19 @@
+[project]
+name = "box-downloader"
+version = "1.0.0"
+description = "Download PDFs from Box.com preview pages"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyVirtualDisplay>=3.0",
+    "selenium>=4.0.0",
+    "webdriver-manager>=4.0.0",
+    "tqdm>=4.0.0",
+    "img2pdf>=0.5.0",
+    "pillow>=10.0.0",
+    "urllib3>=2.0.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+box-download = "main:main"

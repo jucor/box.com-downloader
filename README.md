@@ -1,37 +1,76 @@
 # Box.com PDF Downloader
 
-This application can scrape and download protected docx, pdf files in box.com and save it as an editable PDF file.
+Download protected PDF files from Box.com preview pages by capturing rendered page images.
 
-### Installation
+## Installation
 
-This app requires [Python](https://python.org/) 3 to run.
-
-Clone the repository and install the dependencies.
+Requires Python 3.10+ and [uv](https://github.com/astral-sh/uv).
 
 ```sh
-$ git clone https://github.com/lfasmpao/box.com-downloader
-$ cd box.com-downloader
-$ pip install -r requirements.txt
-$ python main.py -h
+git clone https://github.com/lfasmpao/box.com-downloader
+cd box.com-downloader
+uv sync
 ```
 
-Note: This requires chrome selenium driver in order to work, you can download and install it from [here](http://chromedriver.chromium.org/downloads)
+ChromeDriver is automatically downloaded by `webdriver-manager`.
 
-### Example Usage
+For OCR support, install `ocrmypdf`:
 ```sh
-$ cd box.com-downloader
-$ python main.py https://app.box.com/s/hs5de51wub2htrcl0hxn1wir4zpmf3wj
+brew install ocrmypdf  # macOS
 ```
 
-### Development
+## Usage
 
-Want to contribute? Great!
-Make a change in your file and instantanously see your updates!
+```sh
+uv run python main.py <box.com-url>
+```
 
-### Todos
- - Write MORE Tests
- - Checkout the source code to know more
+### Examples
 
-License
-----
+```sh
+# Basic download
+uv run python main.py https://app.box.com/s/hs5de51wub2htrcl0hxn1wir4zpmf3wj
+
+# Download with grayscale conversion (smaller file)
+uv run python main.py --grayscale https://app.box.com/s/...
+
+# Download with OCR (searchable text)
+uv run python main.py --ocr https://app.box.com/s/...
+
+# Full pipeline: grayscale + OCR
+uv run python main.py --grayscale --ocr https://app.box.com/s/...
+
+# Process existing images (skip download)
+uv run python main.py --from-images dl_files/MyDocument --grayscale --ocr
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--grayscale`, `-g` | Convert to grayscale (smaller file) |
+| `--ocr` | Add searchable text layer (requires `ocrmypdf`) |
+| `--ocr-lang` | OCR language, e.g., `eng`, `fra`, `eng+fra` (default: `eng`) |
+| `--from-images`, `-i` | Process existing images instead of downloading |
+| `--no-pdf` | Don't create PDF, just download images |
+| `--no-keep-images` | Delete images after creating PDF |
+| `--max-pages` | Limit number of pages to capture |
+
+## Post-processing (manual)
+
+If you prefer to run tools manually:
+
+```sh
+# Convert images to PDF
+img2pdf dl_files/page_*.png -o output.pdf
+
+# Convert to grayscale with ImageMagick
+magick mogrify -colorspace Gray dl_files/page_*.png
+
+# Add OCR (install: brew install ocrmypdf)
+ocrmypdf --optimize 0 --skip-text --jobs 4 input.pdf output_ocr.pdf
+```
+
+## License
+
 GNU General Public License v3.0

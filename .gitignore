@@ -104,3 +104,8 @@ venv.bak/
 # mypy
 .mypy_cache/
 .DS_Store
+
+# Project-specific
+dl_files/
+*.pdf
+sidecar.txt
